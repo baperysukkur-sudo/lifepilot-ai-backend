@@ -1,199 +1,225 @@
+// LifePilot AI - Groq Backend
+// Node.js 18+
+
 const http = require("http");
 
-const PORT = process.env.PORT || 8787;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";
+const PORT = Number(process.env.PORT || 8787);
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
-function send(res, status, data) {
+function sendJson(res, status, data) {
+  const body = JSON.stringify(data);
+
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
   });
-  res.end(JSON.stringify(data));
+
+  res.end(body);
 }
 
-function getBody(req) {
+function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
 
     req.on("data", chunk => {
       body += chunk;
-      if (body.length > 1000000) req.destroy();
-    });
 
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(body || "{}"));
-      } catch {
-        reject(new Error("Invalid JSON"));
+      if (body.length > 1000000) {
+        req.destroy();
+        reject(new Error("Request too large"));
       }
     });
 
+    req.on("end", () => resolve(body));
     req.on("error", reject);
   });
 }
 
-function extractSources(obj, result = []) {
-  if (!obj || typeof obj !== "object") return result;
+function askGroq(messages) {
+  return new Promise((resolve, reject) => {
+    if (!GROQ_API_KEY) {
+      reject(new Error("GROQ_API_KEY is missing"));
+      return;
+    }
 
-  if (Array.isArray(obj)) {
-    for (const item of obj) extractSources(item, result);
-    return result;
-  }
-
-  if (obj.url && typeof obj.url === "string") {
-    result.push({
-      title: obj.title || obj.url,
-      url: obj.url
+    const data = JSON.stringify({
+      model: MODEL,
+      messages: messages,
+      temperature: 0.7,
+      max_tokens: 2048
     });
-  }
 
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      extractSources(value, result);
-    }
-  }
-
-  return result;
-}
-
-async function chat(message, history, useWeb) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is not configured.");
-  }
-
-  const input = [];
-
-  input.push({
-    role: "system",
-    content:
-      "You are LifePilot AI, a highly capable personal AI assistant. " +
-      "Answer naturally and helpfully in the same language as the user. " +
-      "You can explain, write, plan, compare, analyze and solve problems. " +
-      "Use conversation history when useful. " +
-      "Never claim that you performed an action unless you actually did it. " +
-      "When web search is available and current, recent, changing, " +
-      "location-specific or Internet information is requested, use web search."
-  });
-
-  if (Array.isArray(history)) {
-    for (const item of history.slice(-12)) {
-      if (!item || !item.role || !item.content) continue;
-
-      input.push({
-        role: item.role === "assistant" ? "assistant" : "user",
-        content: String(item.content).slice(0, 10000)
-      });
-    }
-  }
-
-  input.push({
-    role: "user",
-    content: String(message).slice(0, 20000)
-  });
-
-  const requestBody = {
-    model: OPENAI_MODEL,
-    input
-  };
-
-  if (useWeb) {
-    requestBody.tools = [
+    const request = https.request(
       {
-        type: "web_search"
+        hostname: "api.groq.com",
+        path: "/openai/v1/chat/completions",
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(data)
+        }
+      },
+      response => {
+        let result = "";
+
+        response.on("data", chunk => {
+          result += chunk;
+        });
+
+        response.on("end", () => {
+          try {
+            const json = JSON.parse(result);
+
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+              reject(
+                new Error(
+                  json?.error?.message ||
+                  `Groq API error: ${response.statusCode}`
+                )
+              );
+              return;
+            }
+
+            const reply =
+              json?.choices?.[0]?.message?.content ||
+              "দুঃখিত, আমি এখন উত্তর দিতে পারছি না।";
+
+            resolve(reply);
+          } catch (error) {
+            reject(new Error("Invalid response from Groq"));
+          }
+        });
       }
-    ];
-  }
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify(requestBody)
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error?.message || "OpenAI API request failed."
     );
-  }
 
-  const reply =
-    data.output_text ||
-    data.output
-      ?.filter(x => x.type === "message")
-      ?.flatMap(x => x.content || [])
-      ?.filter(x => x.type === "output_text")
-      ?.map(x => x.text)
-      ?.join("\n") ||
-    "দুঃখিত, কোনো উত্তর পাওয়া যায়নি।";
-
-  const rawSources = extractSources(data);
-  const seen = new Set();
-
-  const sources = rawSources.filter(source => {
-    if (!source.url || seen.has(source.url)) return false;
-    seen.add(source.url);
-    return true;
-  }).slice(0, 10);
-
-  return { reply, sources };
+    request.on("error", reject);
+    request.write(data);
+    request.end();
+  });
 }
+
+const https = require("https");
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    send(res, 204, {});
+    sendJson(res, 204, {});
     return;
   }
 
   if (req.method === "GET" && req.url === "/health") {
-    send(res, 200, {
+    sendJson(res, 200, {
       ok: true,
-      service: "LifePilot AI Backend"
+      service: "LifePilot AI",
+      provider: "Groq",
+      model: MODEL
+    });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/") {
+    sendJson(res, 200, {
+      ok: true,
+      service: "LifePilot AI Backend",
+      status: "running"
     });
     return;
   }
 
   if (req.method === "POST" && req.url === "/api/chat") {
     try {
-      const body = await getBody(req);
+      const raw = await readBody(req);
 
-      if (!body.message || !String(body.message).trim()) {
-        send(res, 400, {
-          error: "Message is required."
+      let body;
+
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        sendJson(res, 400, {
+          error: "Invalid JSON"
         });
         return;
       }
 
-      const result = await chat(
-        String(body.message).trim(),
-        Array.isArray(body.history) ? body.history : [],
-        body.use_web === true
-      );
+      const message =
+        typeof body.message === "string"
+          ? body.message.trim()
+          : "";
 
-      send(res, 200, result);
+      if (!message) {
+        sendJson(res, 400, {
+          error: "Message is required"
+        });
+        return;
+      }
+
+      let history = Array.isArray(body.history)
+        ? body.history
+        : [];
+
+      history = history
+        .filter(item =>
+          item &&
+          typeof item.role === "string" &&
+          typeof item.content === "string"
+        )
+        .slice(-20);
+
+      const messages = [
+        {
+          role: "system",
+          content:
+            "তুমি LifePilot AI-এর ব্যক্তিগত AI assistant। " +
+            "ব্যবহারকারীর ভাষায় উত্তর দেবে। ব্যবহারকারী বাংলা লিখলে বাংলায় উত্তর দেবে। " +
+            "তুমি সাধারণ প্রশ্নের উত্তর, ব্যাখ্যা, লেখা, পরিকল্পনা, পড়াশোনা, সমস্যা সমাধান, " +
+            "আইডিয়া, কোড এবং দৈনন্দিন কাজে সাহায্য করবে। " +
+            "উত্তর পরিষ্কার, উপকারী এবং স্বাভাবিক রাখবে। " +
+            "তুমি কোনো কাজ বাস্তবে করে ফেলেছ বলে মিথ্যা দাবি করবে না।"
+        }
+      ];
+
+      for (const item of history) {
+        const role =
+          item.role === "assistant" ? "assistant" : "user";
+
+        messages.push({
+          role,
+          content: item.content.slice(0, 10000)
+        });
+      }
+
+      messages.push({
+        role: "user",
+        content: message
+      });
+
+      const reply = await askGroq(messages);
+
+      sendJson(res, 200, {
+        reply,
+        sources: []
+      });
+
     } catch (error) {
-      console.error(error);
+      console.error("CHAT ERROR:", error);
 
-      send(res, 500, {
-        error: error.message || "Server error."
+      sendJson(res, 500, {
+        error: "AI server error",
+        message: error.message
       });
     }
 
     return;
   }
 
-  send(res, 404, {
-    error: "Not found."
+  sendJson(res, 404, {
+    error: "Not found"
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`LifePilot AI Backend running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`LifePilot AI running on port ${PORT}`);
 });
